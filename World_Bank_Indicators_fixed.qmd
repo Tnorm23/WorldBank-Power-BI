@@ -1,0 +1,460 @@
+---
+title: "World_Bank_Indicators"
+format:
+  html:
+    toc: true
+    number-sections: true
+editor: visual
+author: "Thierry Norman"
+execute:
+  echo: false
+---
+
+``` {r echo=TRUE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(stringr)
+library(scales)
+
+# Load dataset
+Global_Development_Indicators <- read_csv("R-DATA/project_1_Global_Development_Indicators.csv")
+
+# Country metadata from the World Bank: real economies have a Region, aggregates do not
+country_meta <- read_csv("R-DATA/country_metadata.csv") %>%
+  select(`Country Code`, Region, IncomeGroup)
+
+real_countries <- country_meta %>%
+  filter(!is.na(Region))
+
+# Clean data: convert ".." to NA and numeric conversion
+base_clean <- Global_Development_Indicators %>%
+  mutate(across(starts_with("19") | starts_with("20"), ~ifelse(.x == "..", NA, as.numeric(.x))))
+
+# Extract and reshape indicators
+gdp_data <- base_clean %>%
+  filter(`Series Name` == "GDP (current US$)") %>%
+  select(`Country Name`, `Country Code`, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), names_to = "Year", values_to = "GDP_total") %>%
+  mutate(Year = as.numeric(str_extract(Year, "\\d{4}"))) %>%
+  filter(!is.na(GDP_total))
+
+pop_data <- base_clean %>%
+  filter(`Series Name` == "Population, total") %>%
+  select(`Country Name`, `Country Code`, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), names_to = "Year", values_to = "Population") %>%
+  mutate(Year = as.numeric(str_extract(Year, "\\d{4}"))) %>%
+  filter(!is.na(Population))
+
+internet_data <- base_clean %>%
+  filter(`Series Name` == "Individuals using the Internet (% of population)") %>%
+  select(`Country Name`, `Country Code`, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), names_to = "Year", values_to = "Internet_users_pct") %>%
+  mutate(Year = as.numeric(str_extract(Year, "\\d{4}"))) %>%
+  filter(!is.na(Internet_users_pct))
+
+education_data <- base_clean %>%
+  filter(`Series Name` == "Adolescents out of school (% of lower secondary school age)") %>%
+  select(`Country Name`, `Country Code`, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), names_to = "Year", values_to = "Out_of_school_pct") %>%
+  mutate(Year = as.numeric(str_extract(Year, "\\d{4}"))) %>%
+  filter(!is.na(Out_of_school_pct))
+
+# Combine datasets before any country filtering
+combined <- gdp_data %>%
+  left_join(pop_data, by = c("Country Name", "Country Code", "Year")) %>%
+  mutate(GDP_per_capita = GDP_total / Population) %>%
+  left_join(internet_data, by = c("Country Name", "Country Code", "Year")) %>%
+  left_join(education_data, by = c("Country Name", "Country Code", "Year")) %>%
+  filter(Year >= 2000)
+
+# Keep only real economies by joining on country code (replaces the old name-based filter)
+analysis_data <- combined %>%
+  inner_join(real_countries, by = "Country Code") %>%
+  select(`Country Name`, `Country Code`, Region, IncomeGroup, Year,
+         GDP_per_capita, Internet_users_pct, Out_of_school_pct)
+
+complete_countries <- analysis_data %>%
+  filter(!is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  distinct(`Country Name`)
+
+glimpse(analysis_data)
+```
+
+# Introduction
+
+This project explores global development indicators from 2000 onwards.\
+We are particularly interested in understanding the relationship between economic development, digital access, and education across countries.
+
+The main objectives of this analysis are:
+
+-   Examine trends in GDP per capita and internet usage over time.
+-   Understand how economic prosperity correlates with digital connectivity.
+-   Identify countries that deviate from expected patterns, highlighting potential development gaps.
+-   Provide insights into the evolution of key development indicators over the last two decades.
+
+## Data Cleaning and Preparation
+
+The dataset was obtained from the World Bank Global Development Indicators service.
+
+**Steps undertaken for data preparation:**
+
+-   Converted all non-numeric entries to `NA` and converted years to numeric format.
+
+-   Filtered for the indicators of interest: GDP, population, internet usage, and adolescents out of school.
+
+-   Calculated GDP per capita using GDP and population data.
+
+-   Filtered to include data from the year 2000 onward.
+
+-   Excluded aggregates (e.g., World, East Asia & Pacific, OECD members) by keeping only economies that have a region in the World Bank country metadata, joined on country code.
+
+**Outcome:**
+
+-   The final dataset covers `r n_distinct(analysis_data[["Country Code"]])` countries from `r min(analysis_data$Year)` to `r max(analysis_data$Year)` (`r nrow(analysis_data)` country-years).
+
+-   `r n_distinct(complete_countries[["Country Name"]])` countries have both GDP per capita and internet usage for at least one year.
+
+-   GDP per capita is available for `r round(mean(!is.na(analysis_data$GDP_per_capita)) * 100, 1)`% of country-years and internet usage for `r round(mean(!is.na(analysis_data$Internet_users_pct)) * 100, 1)`%. Out-of-school data is far sparser (`r round(mean(!is.na(analysis_data$Out_of_school_pct)) * 100, 1)`%), so it is only used in the final check in section 4.
+
+## Data Quality Check: Country Filter
+
+An earlier version of this analysis removed aggregates by matching words in country names. This check compares that approach with the metadata join used above.
+
+```{r}
+old_pattern <- "World|income|Arab|East Asia|Europe|Latin|Middle|North America|South Asia|Sub-Saharan"
+
+old_filter_names <- combined %>%
+  filter(!str_detect(`Country Name`, old_pattern)) %>%
+  distinct(`Country Name`) %>%
+  pull()
+
+new_filter_names <- analysis_data %>%
+  distinct(`Country Name`) %>%
+  pull()
+
+wrongly_removed <- setdiff(new_filter_names, old_filter_names)
+wrongly_kept <- setdiff(old_filter_names, new_filter_names)
+
+cat("Real countries the name filter removed:", length(wrongly_removed), "\n")
+print(wrongly_removed)
+
+cat("\nKept by the name filter but not in the World Bank country list:", length(wrongly_kept), "\n")
+print(wrongly_kept)
+```
+
+**Insight:** Matching on names is fragile: "Arab" also matches the United Arab Emirates. Joining on the World Bank's country codes removes aggregates without dropping real countries.
+
+# Exploratory Data Analysis
+
+### 3.1 Summary Statistics
+
+```{r}
+# Summary statistics for key variables
+summary_stats <- analysis_data %>%
+  select(GDP_per_capita, Internet_users_pct) %>%
+  summary()
+
+print("Summary Statistics:")
+print(summary_stats)
+
+# More detailed statistics
+detailed_stats <- analysis_data %>%
+  filter(!is.na(GDP_per_capita) | !is.na(Internet_users_pct)) %>%
+  summarise(
+    # GDP per capita statistics
+    GDP_mean = mean(GDP_per_capita, na.rm = TRUE),
+    GDP_median = median(GDP_per_capita, na.rm = TRUE),
+    GDP_sd = sd(GDP_per_capita, na.rm = TRUE),
+    GDP_min = min(GDP_per_capita, na.rm = TRUE),
+    GDP_max = max(GDP_per_capita, na.rm = TRUE),
+
+    # Internet usage statistics
+    Internet_mean = mean(Internet_users_pct, na.rm = TRUE),
+    Internet_median = median(Internet_users_pct, na.rm = TRUE),
+    Internet_sd = sd(Internet_users_pct, na.rm = TRUE),
+    Internet_min = min(Internet_users_pct, na.rm = TRUE),
+    Internet_max = max(Internet_users_pct, na.rm = TRUE),
+
+    # Data availability
+    total_observations = n(),
+    gdp_available = sum(!is.na(GDP_per_capita)),
+    internet_available = sum(!is.na(Internet_users_pct)),
+    both_available = sum(!is.na(GDP_per_capita) & !is.na(Internet_users_pct))
+  )
+
+print("Detailed Statistics:")
+print(detailed_stats)
+```
+
+**Insight:** GDP per capita is skewed with a few very high-income countries. Internet usage shows a wide spread with gradual global adoption.
+
+### 3.2 Data Availability by Year
+
+```{r}
+# Check data availability by year
+data_by_year <- analysis_data %>%
+  group_by(Year) %>%
+  summarise(
+    countries = n_distinct(`Country Name`),
+    gdp_available = sum(!is.na(GDP_per_capita)),
+    internet_available = sum(!is.na(Internet_users_pct)),
+    both_available = sum(!is.na(GDP_per_capita) & !is.na(Internet_users_pct)),
+    .groups = "drop"
+  )
+
+print("Data Availability by Year:")
+print(data_by_year)
+```
+
+**Insight:** Data availability improves after 2005, allowing reliable comparisons across countries.
+
+### 3.3 Correlation Analysis
+
+```{r}
+correlation <- cor(analysis_data$GDP_per_capita, analysis_data$Internet_users_pct,
+                   use = "complete.obs")
+
+log_set <- analysis_data %>% filter(GDP_per_capita > 0)
+correlation_log <- cor(log(log_set$GDP_per_capita), log_set$Internet_users_pct,
+                       use = "complete.obs")
+
+cat("Correlation between GDP per capita and Internet usage:", round(correlation, 3), "\n")
+cat("Correlation between log GDP per capita and Internet usage:", round(correlation_log, 3), "\n")
+```
+
+**Insight:** The correlation is `r round(correlation, 3)` on raw GDP per capita and `r round(correlation_log, 3)` on log GDP per capita. The log version matches the log-scale charts below, so it better describes the relationship they show.
+
+### 3.4 Visualizations
+
+#### 3.4.1 GDP per Capita Distribution
+
+```{r}
+gdp_histogram <- analysis_data %>%
+  filter(!is.na(GDP_per_capita)) %>%
+  ggplot(aes(x = GDP_per_capita)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7, color = "white") +
+  scale_x_log10(labels = scales::dollar_format()) +
+  labs(
+    title = "Distribution of GDP per Capita",
+    subtitle = "Log scale, all countries and years",
+    x = "GDP per Capita (USD, log scale)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+print(gdp_histogram)
+```
+
+**Insight:** Most countries cluster at lower GDP levels; a few countries are extreme high-income outliers.
+
+#### 3.4.2 Internet Usage Distribution
+
+```{r}
+ internet_histogram <- analysis_data %>%
+  filter(!is.na(Internet_users_pct)) %>%
+  ggplot(aes(x = Internet_users_pct)) +
+  geom_histogram(bins = 30, fill = "forestgreen", alpha = 0.7, color = "white") +
+  labs(
+    title = "Distribution of Internet Usage",
+    subtitle = "Percentage of population using internet",
+    x = "Internet Users (% of population)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+print(internet_histogram)
+
+```
+
+**Insight:** Internet usage varies widely; adoption has increased over time, especially in developing countries.
+
+#### 3.4.3 GDP vs Internet Usage Scatter Plot
+
+```{r}
+scatter_plot <- analysis_data %>%
+  filter(!is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  ggplot(aes(x = GDP_per_capita, y = Internet_users_pct)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  scale_x_log10(labels = scales::dollar_format()) +
+  labs(
+    title = "Economic Development vs Digital Access",
+    subtitle = paste("Correlation (log GDP):", round(correlation_log, 3)),
+    x = "GDP per Capita (USD, log scale)",
+    y = "Internet Users (% of population)"
+  ) +
+  theme_minimal()
+
+print(scatter_plot)
+```
+
+**Insight:** Positive trend confirms richer countries generally have higher internet penetration, with some notable outliers.
+
+#### 3.4.4 Time Series Analysis of Global Internet Usage
+
+```{r}
+time_series <- analysis_data %>%
+  filter(!is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  group_by(Year) %>%
+  summarise(
+    avg_gdp = mean(GDP_per_capita, na.rm = TRUE),
+    avg_internet = mean(Internet_users_pct, na.rm = TRUE),
+    countries = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Year)) +
+  geom_line(aes(y = avg_internet), color = "forestgreen", size = 1.2) +
+  geom_point(aes(y = avg_internet), color = "forestgreen", size = 2) +
+  labs(
+    title = "Global Average Internet Usage Over Time",
+    subtitle = "Average across all countries with available data",
+    x = "Year",
+    y = "Average Internet Users (% of population)"
+  ) +
+  theme_minimal()
+
+print(time_series)
+
+```
+
+**Insight:** Internet usage has steadily increased globally, reflecting digital adoption trends across nations.
+
+#### 3.4.5 Internet Access by World Bank Income Group
+
+```{r}
+income_levels <- c("Low income", "Lower middle income", "Upper middle income", "High income")
+
+box_plot <- analysis_data %>%
+  filter(!is.na(Internet_users_pct), IncomeGroup %in% income_levels) %>%
+  ggplot(aes(x = factor(IncomeGroup, levels = income_levels),
+             y = Internet_users_pct)) +
+  geom_boxplot(aes(fill = IncomeGroup), alpha = 0.7) +
+  scale_fill_brewer(type = "seq", palette = "Blues") +
+  labs(
+    title = "Internet Access by Income Group",
+    subtitle = "World Bank income classification (current), all years",
+    x = "World Bank Income Group",
+    y = "Internet Users (% of population)",
+    fill = "Income Group"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(box_plot)
+
+```
+
+**Insight:** Higher income groups consistently have higher internet usage; some low-income countries outperform expectations. Income groups are the World Bank's current classification, applied to every year.
+
+#### 3.5 Outlier Analysis
+
+```{r}
+outliers_high_gdp_low_internet <- analysis_data %>%
+  filter(!is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  filter(GDP_per_capita > 20000, Internet_users_pct < 50) %>%
+  arrange(desc(GDP_per_capita)) %>%
+  select(`Country Name`, Year, GDP_per_capita, Internet_users_pct)
+
+if(nrow(outliers_high_gdp_low_internet) > 0) {
+  print("Countries with High GDP but Low Internet Usage:")
+  print(outliers_high_gdp_low_internet)
+}
+
+# Low GDP but high internet usage
+outliers_low_gdp_high_internet <- analysis_data %>%
+  filter(!is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  filter(GDP_per_capita < 5000, Internet_users_pct > 50) %>%
+  arrange(desc(Internet_users_pct)) %>%
+  select(`Country Name`, Year, GDP_per_capita, Internet_users_pct)
+
+if(nrow(outliers_low_gdp_high_internet) > 0) {
+  print("Countries with Low GDP but High Internet Usage:")
+  print(outliers_low_gdp_high_internet)
+}
+
+
+```
+
+**Insight:** Outliers suggest countries with unique economic or technological circumstances; these may be of interest for further study. Thresholds are in current US dollars, so they are not adjusted for inflation.
+
+#### 3.6 Recent Trends (2020-2023)
+
+```{r}
+recent_trends <- analysis_data %>%
+  filter(Year >= 2020, !is.na(GDP_per_capita), !is.na(Internet_users_pct)) %>%
+  group_by(`Country Name`) %>%
+  summarise(
+    years_available = n(),
+    avg_gdp = mean(GDP_per_capita),
+    avg_internet = mean(Internet_users_pct),
+    latest_year = max(Year),
+    .groups = "drop"
+  ) %>%
+  filter(years_available >= 2) %>%
+  arrange(desc(avg_internet))
+
+print("Recent Trends (2020-2023) - Top 10 Countries by Internet Usage:")
+print(head(recent_trends, 10))
+```
+
+**Insight:** High internet usage countries continue to lead, while many developing nations show rapid improvements since 2020.
+
+#### 3.7 Key Insights Summary
+
+```{r}
+cat("\n=== KEY INSIGHTS FROM EXPLORATORY ANALYSIS ===\n")
+cat("1. Data Coverage:", nrow(analysis_data), "total observations\n")
+cat("2. GDP-Internet Correlation:", round(correlation, 3), "(log GDP:", round(correlation_log, 3), ")\n")
+cat("3. Countries with complete data:", nrow(complete_countries), "\n")
+cat("4. Year range:", min(analysis_data$Year), "to", max(analysis_data$Year), "\n")
+cat("5. Average global internet usage has", ifelse(correlation > 0.5, "strong", "moderate"), "correlation with economic development\n")
+
+```
+
+**Summary:**
+
+-   Economic development strongly correlates with digital access.
+
+-   Global internet adoption is steadily increasing.
+
+-   Outliers and trends provide insight into countries that perform above or below expectations.
+
+#### 3.8 Internet Usage and Adolescents Out of School
+
+```{r}
+education_check <- analysis_data %>%
+  filter(!is.na(Internet_users_pct), !is.na(Out_of_school_pct))
+
+education_cor <- cor(education_check$Internet_users_pct, education_check$Out_of_school_pct)
+
+cat("Country-years with both values:", nrow(education_check), "\n")
+cat("Countries:", n_distinct(education_check$`Country Name`), "\n")
+cat("Correlation between internet usage and out-of-school rate:", round(education_cor, 3), "\n")
+```
+
+# Key Insights and Implications
+
+1.  **Economic and Digital Development:** Wealthier countries generally have better internet access, confirming the strong correlation between GDP per capita and digital infrastructure.
+
+2.  **Global Trends:** Internet adoption has increased globally, with notable improvements in developing regions over the last decade.
+
+3.  **Outliers:** Some countries deviate from expected patterns, providing opportunities for targeted policy interventions or further research.
+
+4.  **Education and Development:** Across `r nrow(education_check)` country-years with both values, the correlation between internet usage and the share of adolescents out of school is `r round(education_cor, 3)`. Out-of-school data is sparse, so this is indicative only.
+
+**Limitations:**
+
+-   Missing data for some countries, especially in early years, may bias trends.
+
+-   Indicators are national averages and may mask regional disparities.
+
+-   GDP is in current US dollars, so comparisons over time are not inflation-adjusted.
+
+-   Averages weight every country equally, regardless of population.
+
+**Future Research:**
+
+-   Examine subnational data to capture regional inequalities.
+
+-   Explore causal relationships between GDP growth and digital adoption.
+
+-   Investigate other indicators such as life expectancy, literacy, or healthcare access in conjunction with digital access.
